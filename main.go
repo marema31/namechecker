@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -20,10 +20,23 @@ var web = http.DefaultClient
 var usageCount uint32
 
 // Declare a counter of request for a user that will be updated with mutexes
-var nameChecked map[string]int = map[string]int{}
+var nameChecked map[string]uint32 = map[string]uint32{}
 
 // The mutex
 var mu sync.Mutex
+
+type availability struct {
+	Platform  string `json:socialNetwork`
+	Valid     bool
+	Available bool
+}
+
+type response struct {
+	Username     string
+	Requested    uint32
+	RequestID    uint32
+	Availability []availability
+}
 
 var checkers []checker.Checker = []checker.Checker{
 	&twitter.Twitter{},
@@ -54,11 +67,12 @@ var checkers []checker.Checker = []checker.Checker{
 	&github.Github{},
 }
 
-func checkUser(wg *sync.WaitGroup, ch chan string, username string, c checker.Checker) {
+func checkUser(wg *sync.WaitGroup, ch chan availability, username string, c checker.Checker) {
 	defer wg.Done()
-	message := fmt.Sprintf("%s : ", c.Name())
+	var message availability
+	message.Platform = c.Name()
 	if c.Check(username) {
-		message += "valid"
+		message.Valid = true
 		available, err := c.IsAvailable(web, username)
 		if err != nil {
 			log.Printf("No way to contact Twitter: %s", err)
@@ -72,13 +86,7 @@ func checkUser(wg *sync.WaitGroup, ch chan string, username string, c checker.Ch
 				log.Fatal(err.Unwrap())
 			}
 		}
-		if available {
-			message += ", available"
-		} else {
-			message += ", not available"
-		}
-	} else {
-		message += "invalid"
+		message.Available = available
 	}
 	ch <- message
 }
@@ -91,15 +99,17 @@ func sayHello(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
+	//The brace are not mandatory but add a visual indication of the lock section
 	{
 		nameChecked[username]++
 	}
 	mu.Unlock()
-	message := fmt.Sprintf("<h1>User %s  (requested #%d)</h1>", username, nameChecked[username])
+	count := atomic.AddUint32(&usageCount, 1)
+	message := response{Username: username, RequestID: count, Requested: nameChecked[username]}
 
 	var wg sync.WaitGroup
 
-	ch := make(chan string, 4)
+	ch := make(chan availability, 4)
 	for _, c := range checkers {
 		wg.Add(1)
 		go checkUser(&wg, ch, username, c)
@@ -111,12 +121,12 @@ func sayHello(w http.ResponseWriter, r *http.Request) {
 		wg.Wait()
 		close(ch)
 	}()
-	for response := range ch {
-		message += response + "<br>"
+	for availabilityResponse := range ch {
+		message.Availability = append(message.Availability, availabilityResponse)
 	}
-	count := atomic.AddUint32(&usageCount, 1)
-	message += fmt.Sprintf("<footer>you are the user #%d</footer>", count)
-	w.Write([]byte(message))
+	messageJSON, _ := json.MarshalIndent(message, "", "    ")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(messageJSON))
 }
 
 func main() {
